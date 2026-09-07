@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""omacode — reach OpenCode from your phone, over your tailnet, safely.
+
+OpenCode already ships a headless server with a full web interface
+(`opencode serve`) and its own HTTP Basic auth (`OPENCODE_SERVER_PASSWORD`).
+This does not reimplement any of that. It does the four things that stand
+between "there is a server" and "I can safely open this on my phone":
+
+  1. mints a strong password and keeps it 0600, so the server is never the
+     unsecured one the warning tells you about
+  2. runs the server bound to loopback under a systemd --user unit
+  3. puts it on your tailnet through `tailscale serve` — never Funnel
+  4. makes that exposure *deliberate and temporary*: hidden by default,
+     `expose` to open it, `hide` to close it, and it tells you which it is
+
+Why the ceremony: this endpoint drives an AI agent that can run commands and
+edit files as you. That is a far bigger blast radius than a note-taking app,
+so the exposure is opt-in, both boundaries are stated out loud, and closing it
+is one word.
+
+Stdlib only. See DISCLOSURE.md for everything it touches.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+UNIT = "omacode.service"
+DEFAULT_PORT = 7796
+DEFAULT_HTTPS = 8443
+BASIC_USER = "opencode"          # opencode's server requires this exact username
+
+STATE = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omacode"
+ENV_FILE = STATE / "server.env"          # 0600 — holds the password
+CONF_FILE = STATE / "config.json"
+
+
+# -- helpers -------------------------------------------------------------- #
+def _run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def _sc(*args):
+    return _run(["systemctl", "--user", *args])
+
+
+def _ts(*args):
+    exe = shutil.which("tailscale")
+    if not exe:
+        return None
+    return _run([exe, *args])
+
+
+def conf() -> dict:
+    try:
+        return json.loads(CONF_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_conf(**kw):
+    c = conf(); c.update(kw)
+    STATE.mkdir(parents=True, exist_ok=True)
+    CONF_FILE.write_text(json.dumps(c, indent=2) + "\n")
+
+
+def password() -> str | None:
+    try:
+        m = re.search(r"^OPENCODE_SERVER_PASSWORD=(.+)$", ENV_FILE.read_text(), re.M)
+        return m.group(1).strip() if m else None
+    except OSError:
+        return None
+
+
+def _mint_password() -> str:
+    STATE.mkdir(parents=True, exist_ok=True)
+    pw = secrets.token_urlsafe(24)
+    # write with 0600 from the start — never a moment where it is world-readable
+    fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(f"OPENCODE_SERVER_PASSWORD={pw}\n")
+    return pw
+
+
+def tailnet_host() -> str | None:
+    r = _ts("status", "--json")
+    if not r or r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout).get("Self", {}).get("DNSName", "").rstrip(".") or None
+    except ValueError:
+        return None
+
+
+def exposed_mount() -> tuple[str, int] | None:
+    """(URL, https port) of the serve block currently proxying our port, if any.
+
+    An opencode SPA uses absolute asset paths (/assets/...), so it can never
+    live under a path mount like /code — it must own a dedicated HTTPS port.
+    """
+    r = _ts("serve", "status")
+    if not r:
+        return None
+    target = f"http://127.0.0.1:{conf().get('port', DEFAULT_PORT)}"
+    url = None
+    for line in r.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("https://"):
+            url = s.split()[0]
+        elif s.startswith("http://"):
+            url = None            # only https blocks can carry our mount
+        elif url and s.startswith("|--") and target in s:
+            m = re.search(r":(\d+)\b", url)
+            return url, (int(m.group(1)) if m else 443)
+    return None
+
+
+# -- commands ------------------------------------------------------------- #
+def cmd_init(args):
+    if not shutil.which("opencode"):
+        sys.exit("opencode is not installed or not on PATH")
+    pw = password()
+    if pw and not args.rotate:
+        print(f"password already set ({ENV_FILE}) — use --rotate to replace it")
+    else:
+        pw = _mint_password()
+        print(f"minted a new password -> {ENV_FILE} (0600)")
+
+    work = str(Path(args.dir).expanduser().resolve())
+    if not Path(work).is_dir():
+        sys.exit(f"not a directory: {work}")
+    save_conf(dir=work, port=args.port)
+
+    unit = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "systemd" / "user"
+    unit.mkdir(parents=True, exist_ok=True)
+    (unit / UNIT).write_text(f"""[Unit]
+Description=omacode — OpenCode headless server (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={work}
+EnvironmentFile={ENV_FILE}
+ExecStart={shutil.which("opencode")} serve --port {args.port} --hostname 127.0.0.1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+""")
+    _sc("daemon-reload")
+    print(f"unit written    -> {unit / UNIT}")
+    print(f"working dir     -> {work}")
+    print(f"listening on    -> 127.0.0.1:{args.port}  (loopback only)")
+    print("\nnext:  omacode start   then   omacode expose")
+
+
+def cmd_start(args):
+    if not password():
+        sys.exit("no password yet — run: omacode init")
+    _sc("enable", "--now", UNIT)
+    print(_sc("is-active", UNIT).stdout.strip())
+
+
+def cmd_stop(args):
+    _sc("disable", "--now", UNIT)
+    if exposed_mount():
+        cmd_hide(args)
+    print("stopped")
+
+
+def cmd_expose(args):
+    if _sc("is-active", UNIT).stdout.strip() != "active":
+        sys.exit("server is not running — run: omacode start")
+    port = conf().get("port", DEFAULT_PORT)
+    old = exposed_mount()
+    if old and old[1] == args.https:
+        pass
+    else:
+        _ts("serve", "--https", str(args.https), "off")   # clear any stale block
+    r = _ts("serve", "--bg", "--https", str(args.https), f"http://127.0.0.1:{port}")
+    if r is None:
+        sys.exit("the tailscale CLI is not installed")
+    if r.returncode != 0:
+        sys.exit((r.stderr or r.stdout).strip())
+    save_conf(https_port=args.https)
+    _print_access()
+
+
+def cmd_hide(args):
+    m = exposed_mount()
+    https = m[1] if m else conf().get("https_port")
+    if not https:
+        print("nothing to hide — this port is not served")
+        return
+    url = m[0] if m else f"https://<host>:{https}"
+    r = _ts("serve", "--https", str(https), "off")
+    if r is not None and r.returncode != 0:
+        _ts("serve", "reset")
+    print(f"hidden — {url} is no longer served. The server is still running locally.")
+
+
+def _print_access():
+    host, pw = tailnet_host(), password()
+    m = exposed_mount()
+    if not m:
+        print("not exposed — run `omacode expose` first")
+        return
+    print("OpenCode is on your tailnet:\n")
+    print(f"  URL       {m[0]}")
+    print(f"  user      {BASIC_USER}")
+    print(f"  password  {pw}")
+    print("\nTailnet-only (never Funnel), and the password is the second lock.")
+    print("This drives an agent that can run commands as you — run `omacode hide`")
+    print("when you're done.")
+
+
+def cmd_status(args):
+    active = _sc("is-active", UNIT).stdout.strip()
+    port = conf().get("port", DEFAULT_PORT)
+    m = exposed_mount()
+    print(f"server     {active}  (127.0.0.1:{port}, working dir {conf().get('dir', '?')})")
+    print(f"password   {'set' if password() else 'MISSING — run omacode init'}")
+    if m:
+        print(f"exposed    YES  {m[0]}")
+        print("           anyone on your tailnet with the password can drive the agent")
+    else:
+        print("exposed    no   (reachable only from this machine)")
+
+
+def cmd_url(args):
+    if not exposed_mount():
+        sys.exit("not exposed — run: omacode expose")
+    _print_access()
+
+
+def cmd_logs(args):
+    os.execvp("journalctl", ["journalctl", "--user", "-u", UNIT, "-n", str(args.lines), "--no-pager"])
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="omacode",
+                                description="Reach OpenCode from your phone, over your tailnet.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    i = sub.add_parser("init", help="mint a password and install the service")
+    i.add_argument("dir", nargs="?", default="~/Work", help="directory OpenCode works in")
+    i.add_argument("--port", type=int, default=DEFAULT_PORT)
+    i.add_argument("--rotate", action="store_true", help="replace an existing password")
+    i.set_defaults(func=cmd_init)
+
+    sub.add_parser("start", help="start the local server").set_defaults(func=cmd_start)
+    sub.add_parser("stop", help="stop the server (and hide it)").set_defaults(func=cmd_stop)
+
+    e = sub.add_parser("expose", help="put it on the tailnet (tailnet-only, never Funnel)")
+    e.add_argument("--https", type=int, default=DEFAULT_HTTPS,
+                   help="dedicated HTTPS port (the SPA can't live under a path)")
+    e.set_defaults(func=cmd_expose)
+
+    sub.add_parser("hide", help="take it off the tailnet").set_defaults(func=cmd_hide)
+    sub.add_parser("status", help="what is running and what is reachable").set_defaults(func=cmd_status)
+    sub.add_parser("url", help="print the URL and credentials").set_defaults(func=cmd_url)
+
+    lg = sub.add_parser("logs", help="server logs")
+    lg.add_argument("-n", "--lines", type=int, default=50)
+    lg.set_defaults(func=cmd_logs)
+
+    args = p.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
