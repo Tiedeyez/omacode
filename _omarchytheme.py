@@ -16,6 +16,8 @@ from __future__ import annotations
 import http.client
 import os
 import re
+import select
+import socket
 import socketserver
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -177,9 +179,45 @@ def _make_handler(backend: int, app: str):
             self.end_headers()
             self.wfile.write(body)
 
+        def _tunnel(self):
+            """Raw bidirectional pipe for a WebSocket upgrade — the chat uses
+            one, and http.client can't proxy it. Replay the request verbatim to
+            the backend, then pump bytes until either side closes."""
+            try:
+                up = socket.create_connection(("127.0.0.1", backend), timeout=10)
+            except OSError as e:
+                self.send_error(502, f"backend ws: {e}")
+                return
+            req = [f"{self.command} {self.path} {self.request_version}"]
+            req += [f"{k}: {v}" for k, v in self.headers.items()]
+            up.sendall(("\r\n".join(req) + "\r\n\r\n").encode())
+            cli = self.connection
+            cli.setblocking(False)
+            up.setblocking(False)
+            try:
+                while True:
+                    r, _, x = select.select([cli, up], [], [cli, up], 300)
+                    if x or not r:
+                        break
+                    for s in r:
+                        try:
+                            data = s.recv(65536)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except OSError:
+                            return
+                        if not data:
+                            return
+                        (up if s is cli else cli).sendall(data)
+            finally:
+                up.close()
+                self.close_connection = True
+
         def _proxy(self, method):
             if self.path == THEME_ROUTE:
                 return self._serve_theme()
+            if self.headers.get("Upgrade", "").lower() == "websocket":
+                return self._tunnel()
             length = int(self.headers.get("Content-Length") or 0)
             payload = self.rfile.read(length) if length else None
             conn = http.client.HTTPConnection("127.0.0.1", backend, timeout=120)
