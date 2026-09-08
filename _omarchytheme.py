@@ -128,6 +128,19 @@ body {{ background: {p['bg']}; color: {p['fg']}; }}
   --radius: {r}; --radius-sm: {r}; --radius-md: {r}; --radius-lg: {r};
 }}
 body {{ background: {p['bg']}; color: {p['fg']}; }}
+
+/* Hermes' mobile nav drawer (fixed, z-50, w-64, full height) computes to a
+   TRANSPARENT background — same bug in the un-themed dashboard, it just shows
+   worse when the page behind is the same black. Force it to a lifted panel,
+   and make the scrim a real dark layer. */
+.fixed.z-50.w-64,
+[class~="fixed"][class~="z-50"][class~="w-64"] {{
+  background-color: {p['bg_lift']} !important;
+}}
+[class~="fixed"][class~="inset-0"][class~="z-40"],
+[class~="fixed"][class~="inset-0"][class~="z-30"] {{
+  background-color: {p['bg_dim']}d9 !important;
+}}
 """
     return ""
 
