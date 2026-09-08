@@ -243,6 +243,8 @@ class CookieGate:
 <form method=post action="{self.prefix}/login">
  <h1>{self.title}</h1>
  {msg}
+ <input type=text name=username value="{self.title}" autocomplete=username
+   style="display:none" readonly tabindex=-1 aria-hidden=true>
  <input type=password name=password placeholder=password autofocus autocomplete=current-password>
  <button type=submit>sign in</button>
  <p class=m>tailnet + this password. stays signed in on this device.</p>
@@ -250,9 +252,35 @@ class CookieGate:
 
 
 # -- the proxy -------------------------------------------------------------- #
-_INJECT = ('<link rel="stylesheet" href="' + THEME_ROUTE + '">'
-           '<script>try{var m=document.documentElement;'
-           'm.setAttribute("data-theme","%s");m.classList.add("%s")}catch(e){}</script>')
+JS_ROUTE = "/__omarchy.js"
+
+# The wrapped SPAs ship a strict CSP (`script-src 'self'`), so an *inline*
+# injected <script> is blocked. Serving the script from the proxy's own origin
+# as `/__omarchy.js` is 'self' and runs. It: (1) mirrors the theme mode onto
+# <html>, and (2) for opencode, keeps a password manager from offering the
+# proxy's login password on the app's own text fields — a phone keychain does
+# this on every field of an origin once you've signed in there. We can't edit
+# the third-party SPA, so an observer stamps the "ignore me" attributes.
+def _theme_js(app: str, mode: str) -> str:
+    js = (f"try{{var m=document.documentElement;m.setAttribute('data-theme','{mode}');"
+          f"m.classList.add('{mode}')}}catch(e){{}}\n")
+    if app == "opencode":
+        js += (
+            "(function(){function s(e){if(!e||e.type==='password')return;"
+            "e.setAttribute('autocomplete','off');e.setAttribute('data-1p-ignore','');"
+            "e.setAttribute('data-lpignore','true');e.setAttribute('data-bwignore','');"
+            "e.setAttribute('data-form-type','other')}"
+            "function sweep(){document.querySelectorAll("
+            "'input,textarea,[contenteditable],[contenteditable=\"\"],[role=textbox]').forEach(s)}"
+            "try{sweep();new MutationObserver(function(){clearTimeout(window.__naf);"
+            "window.__naf=setTimeout(sweep,120)}).observe(document.documentElement,"
+            "{childList:true,subtree:true})}catch(e){}})();")
+    return js
+
+
+_INJECT_TAGS = (f'<link rel="stylesheet" href="{THEME_ROUTE}">'
+                f'<script src="{JS_ROUTE}"></script>').encode()
+
 _HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
         "upgrade", "proxy-authorization", "proxy-authenticate"}
 
@@ -324,14 +352,21 @@ def _make_handler(backend: int, app: str, gate: "CookieGate | None" = None):
                 self.end_headers()
             return False
 
-        def _serve_theme(self):
-            body = theme_css(app).encode()
+        def _serve_asset(self, body: bytes, ctype: str):
             self.send_response(200)
-            self.send_header("Content-Type", "text/css; charset=utf-8")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _serve_theme(self):
+            self._serve_asset(theme_css(app).encode(), "text/css; charset=utf-8")
+
+        def _serve_js(self):
+            mode = (_palette() or {}).get("mode", "dark")
+            self._serve_asset(_theme_js(app, mode).encode(), "text/javascript; charset=utf-8")
 
         def _tunnel(self):
             """Raw bidirectional pipe for a WebSocket upgrade — the chat uses
@@ -373,8 +408,11 @@ def _make_handler(backend: int, app: str, gate: "CookieGate | None" = None):
                 self.close_connection = True
 
         def _proxy(self, method):
-            if self.path.split("?", 1)[0] == THEME_ROUTE:
+            bare = self.path.split("?", 1)[0]
+            if bare == THEME_ROUTE:
                 return self._serve_theme()
+            if bare == JS_ROUTE:
+                return self._serve_js()
             if not self._gate():
                 return
             if self.headers.get("Upgrade", "").lower() == "websocket":
@@ -428,10 +466,11 @@ def _make_handler(backend: int, app: str, gate: "CookieGate | None" = None):
             finally:
                 conn.close()
 
-            pal = _palette()
-            if pal and "text/html" in ctype and b"</head>" in raw:
-                inj = (_INJECT % (pal["mode"], pal["mode"])).encode()
-                raw = raw.replace(b"</head>", inj + b"</head>", 1)
+            # Inject the <link>+<script> when there's a theme to apply, or for
+            # opencode regardless (the no-autofill script is always wanted).
+            if "text/html" in ctype and b"</head>" in raw and (
+                    _palette() or app == "opencode"):
+                raw = raw.replace(b"</head>", _INJECT_TAGS + b"</head>", 1)
 
             self.send_response(resp.status)
             for k, v in resp.getheaders():
