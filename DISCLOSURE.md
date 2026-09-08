@@ -28,7 +28,11 @@ Nothing outside `$HOME`, never `sudo`.
 
 ## What it reads
 
-Only the three files above. It does not read your projects, documents, or shell
+- `~/.local/state/omarchy/current/theme/colors.toml`, `shell.toml`,
+  `hyprland.lua` — **read-only**, colours and the corner radius only, so the
+  wrapped UI matches your desktop theme. Absent → the app keeps its own look.
+
+Its own state, and the theme files above. It does not read your projects, documents, or shell
 history — but note that **the OpenCode agent it fronts can read and write
 anything your user can**, within the working directory you point it at and
 beyond. That is the whole point of the agent, and the reason for the locks.
@@ -40,10 +44,23 @@ beyond. That is the whole point of the agent, and the reason for the locks.
 | `systemctl --user …` | start / stop / status |
 | `tailscale serve …` / `tailscale status` | expose / hide / url |
 | `opencode serve` | run by the systemd unit, on loopback |
+| `omacode proxy` (this script, theme proxy) | run by a second systemd unit, on loopback |
 | `journalctl --user` | `omacode logs` |
 
 No shell is invoked by omacode itself. (OpenCode's agent runs a shell — that is
 what it does.)
+
+
+### The theme proxy
+
+`omacode start` also runs a ~180-line stdlib reverse proxy on `127.0.0.1:7795`,
+in front of the backend. It forwards every request unchanged (auth headers and
+cookies included) and, on the HTML document only, injects one extra
+`<link>` to `/__omarchy.css` — a stylesheet it generates live from the theme
+files above. It adds nothing else, stores nothing, opens no outbound
+connection, and the backend's auth gate is unaffected (verified: no creds →
+401 through the proxy). `omacode expose` points Tailscale at this proxy; without
+it, the raw un-themed backend is served instead.
 
 ## Network
 
