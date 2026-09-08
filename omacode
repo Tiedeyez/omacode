@@ -171,6 +171,10 @@ def cmd_init(args):
     (unit / UNIT).write_text(f"""[Unit]
 Description=omacode — OpenCode headless server (loopback only)
 After=network.target
+# the tailnet mount points at the proxy, and the proxy BindsTo= this unit, so
+# a bounce here drops the proxy — Upholds= brings it straight back rather than
+# leaving the phone URL 502ing until the next `omacode start`
+Upholds={THEME_UNIT}
 
 [Service]
 Type=simple
