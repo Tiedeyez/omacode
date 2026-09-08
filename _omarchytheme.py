@@ -10,15 +10,26 @@ document, injects one extra stylesheet — `/__omarchy.css` — built live from
 Stdlib only. Shared verbatim by omacode and hermcode.
 
     serve(listen=7795, backend=7796, app="opencode")
+
+Optionally it also holds a login for a backend whose only auth is HTTP Basic
+(OpenCode's is): pass a `CookieGate` and the proxy serves its own login page,
+sets a signed cookie that survives an app-switch, and injects the Basic header
+upstream itself — so a phone browser stops re-prompting every time you leave
+the tab. hermes has real sessions and passes no gate.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import http.client
 import os
 import re
 import select
 import socket
 import socketserver
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -155,6 +166,89 @@ def theme_css(app: str) -> str:
             + _rules(app, p))
 
 
+# -- optional cookie login in front of a Basic-only backend --------------- #
+class CookieGate:
+    """A signed-cookie session that fronts an HTTP-Basic backend.
+
+    The browser authenticates once against a login page here; the proxy holds
+    the Basic credential and adds it to every upstream request. The cookie is
+    an HMAC over its issue time, so it needs no server-side store and survives
+    a proxy restart (the secret is stable). Backgrounding the tab no longer
+    drops the login the way a Basic credential does.
+    """
+
+    def __init__(self, secret: str, password: str, username: str,
+                 prefix: str = "/__gate", title: str = "sign in",
+                 max_age_days: int = 14):
+        self._secret = secret.encode()
+        self.password = password
+        self.prefix = prefix
+        self.title = title
+        self.max_age = max_age_days * 86400
+        self.upstream_auth = "Basic " + base64.b64encode(
+            f"{username}:{password}".encode()).decode()
+
+    def _sign(self, msg: bytes) -> str:
+        return hmac.new(self._secret, msg, hashlib.sha256).hexdigest()[:32]
+
+    def mint(self) -> str:
+        ts = str(int(time.time()))
+        return f"{ts}.{self._sign(ts.encode())}"
+
+    def valid(self, token: str | None) -> bool:
+        if not token or "." not in token:
+            return False
+        ts, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, self._sign(ts.encode())):
+            return False
+        try:
+            return (time.time() - int(ts)) < self.max_age
+        except ValueError:
+            return False
+
+    def token_from_cookie(self, header: str) -> str | None:
+        for part in (header or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "session":
+                return v
+        return None
+
+    def password_ok(self, attempt: str) -> bool:
+        return bool(self.password) and hmac.compare_digest(attempt, self.password)
+
+    def login_html(self, error: bool = False) -> bytes:
+        p = _palette() or {"bg": "#0e0e10", "fg": "#e8e8ea", "accent": "#e8e8ea",
+                           "bg_lift": "#17171a", "muted": "#8b8b93", "mode": "dark"}
+        r = _rounding()
+        msg = ('<p class="e">that password didn’t match</p>' if error else "")
+        return f"""<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>{self.title}</title>
+<style>
+ :root {{ color-scheme: {p['mode']}; }}
+ body {{ margin:0; min-height:100vh; display:grid; place-items:center;
+   background:{p['bg']}; color:{p['fg']};
+   font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }}
+ form {{ background:{p['bg_lift']}; border:1px solid {p['fg']}22; border-radius:{r};
+   padding:28px; width:min(88vw,320px); display:flex; flex-direction:column; gap:12px; }}
+ h1 {{ font-size:1rem; margin:0 0 4px; font-weight:600; }}
+ input {{ font:inherit; padding:9px 11px; border-radius:{r};
+   border:1px solid {p['fg']}33; background:{p['bg']}; color:{p['fg']}; }}
+ input:focus {{ outline:none; border-color:{p['accent']}; }}
+ button {{ font:inherit; padding:9px; border-radius:{r}; border:1px solid {p['accent']};
+   background:{p['accent']}; color:{p['bg']}; font-weight:600; cursor:pointer; }}
+ .m {{ color:{p['muted']}; font-size:.8rem; }}
+ .e {{ color:#e07a7a; font-size:.8rem; margin:0; }}
+</style>
+<form method=post action="{self.prefix}/login">
+ <h1>{self.title}</h1>
+ {msg}
+ <input type=password name=password placeholder=password autofocus autocomplete=current-password>
+ <button type=submit>sign in</button>
+ <p class=m>tailnet + this password. stays signed in on this device.</p>
+</form>""".encode()
+
+
 # -- the proxy -------------------------------------------------------------- #
 _INJECT = ('<link rel="stylesheet" href="' + THEME_ROUTE + '">'
            '<script>try{var m=document.documentElement;'
@@ -163,12 +257,72 @@ _HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
         "upgrade", "proxy-authorization", "proxy-authenticate"}
 
 
-def _make_handler(backend: int, app: str):
+def _make_handler(backend: int, app: str, gate: "CookieGate | None" = None):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *a):
             pass
+
+        # -- cookie gate ------------------------------------------------- #
+        def _redirect(self, to, cookie=None):
+            self.send_response(303)
+            self.send_header("Location", to)
+            self.send_header("Content-Length", "0")
+            if cookie is not None:
+                self.send_header("Set-Cookie", cookie)
+            self.end_headers()
+
+        def _send_html(self, body: bytes, status=200):
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _cookie(self, value, clear=False):
+            secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+            if clear:
+                return f"session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+            return (f"session={value}; Path=/; HttpOnly; SameSite=Lax; "
+                    f"Max-Age={gate.max_age}{secure}")
+
+        def _gate(self) -> bool:
+            """Return True if the request may proceed. Handles login/logout and
+            denies unauthenticated requests itself."""
+            if gate is None:
+                return True
+            path = self.path.split("?", 1)[0]
+            if path == gate.prefix + "/login":
+                if self.command == "POST":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+                    if gate.password_ok((form.get("password") or [""])[0]):
+                        self._redirect("/", self._cookie(gate.mint()))
+                    else:
+                        self._send_html(gate.login_html(error=True), status=401)
+                else:
+                    self._send_html(gate.login_html())
+                return False
+            if path == gate.prefix + "/logout":
+                self._redirect(gate.prefix + "/login", self._cookie("", clear=True))
+                return False
+            if gate.valid(gate.token_from_cookie(self.headers.get("Cookie", ""))):
+                return True
+            # not signed in — send a browser navigation to the login page, but
+            # answer an API/asset/XHR call with a plain 401
+            nav = self.command in ("GET", "HEAD") and (
+                "text/html" in self.headers.get("Accept", "")
+                or self.headers.get("Sec-Fetch-Dest") == "document")
+            if nav:
+                self._redirect(gate.prefix + "/login")
+            else:
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            return False
 
         def _serve_theme(self):
             body = theme_css(app).encode()
@@ -189,7 +343,12 @@ def _make_handler(backend: int, app: str):
                 self.send_error(502, f"backend ws: {e}")
                 return
             req = [f"{self.command} {self.path} {self.request_version}"]
-            req += [f"{k}: {v}" for k, v in self.headers.items()]
+            for k, v in self.headers.items():
+                if gate is not None and k.lower() in ("authorization", "cookie"):
+                    continue                       # the gate owns auth; cookie stays here
+                req.append(f"{k}: {v}")
+            if gate is not None:
+                req.append(f"Authorization: {gate.upstream_auth}")
             up.sendall(("\r\n".join(req) + "\r\n\r\n").encode())
             cli = self.connection
             cli.setblocking(False)
@@ -214,29 +373,64 @@ def _make_handler(backend: int, app: str):
                 self.close_connection = True
 
         def _proxy(self, method):
-            if self.path == THEME_ROUTE:
+            if self.path.split("?", 1)[0] == THEME_ROUTE:
                 return self._serve_theme()
+            if not self._gate():
+                return
             if self.headers.get("Upgrade", "").lower() == "websocket":
                 return self._tunnel()
             length = int(self.headers.get("Content-Length") or 0)
             payload = self.rfile.read(length) if length else None
             conn = http.client.HTTPConnection("127.0.0.1", backend, timeout=120)
-            hdrs = {k: v for k, v in self.headers.items() if k.lower() not in _HOP}
+            _drop = _HOP | ({"authorization", "cookie"} if gate is not None else set())
+            hdrs = {k: v for k, v in self.headers.items() if k.lower() not in _drop}
             hdrs["Host"] = f"127.0.0.1:{backend}"
+            if gate is not None:
+                hdrs["Authorization"] = gate.upstream_auth
             try:
                 conn.request(method, self.path, body=payload, headers=hdrs)
                 resp = conn.getresponse()
-                raw = resp.read()
             except OSError as e:
                 self.send_error(502, f"backend: {e}")
+                conn.close()
                 return
+
+            ctype = resp.getheader("Content-Type", "")
+            # OpenCode's live event feed is Server-Sent Events — an endless
+            # response. Buffering it with .read() would hang the request
+            # forever, so stream it straight through instead.
+            if "text/event-stream" in ctype:
+                if conn.sock:
+                    conn.sock.settimeout(None)      # the stream has no deadline
+                self.close_connection = True
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() not in _HOP | {"content-length", "connection"}:
+                        self.send_header(k, v)
+                self.send_header("Connection", "close")   # length-delimited by EOF
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    while True:
+                        chunk = resp.read1(2048)     # one chunk, don't wait for more
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+                return
+
+            try:
+                raw = resp.read()
             finally:
                 conn.close()
 
-            ctype = resp.getheader("Content-Type", "")
-            mode = (_palette() or {}).get("mode", "dark")
-            if "text/html" in ctype and b"</head>" in raw:
-                inj = (_INJECT % (mode, mode)).encode()
+            pal = _palette()
+            if pal and "text/html" in ctype and b"</head>" in raw:
+                inj = (_INJECT % (pal["mode"], pal["mode"])).encode()
                 raw = raw.replace(b"</head>", inj + b"</head>", 1)
 
             self.send_response(resp.status)
@@ -266,9 +460,10 @@ class _Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
-def serve(listen: int, backend: int, app: str):
-    srv = _Server(("127.0.0.1", listen), _make_handler(backend, app))
-    print(f"omarchy-theme proxy: 127.0.0.1:{listen} -> :{backend} ({app})", flush=True)
+def serve(listen: int, backend: int, app: str, gate: "CookieGate | None" = None):
+    srv = _Server(("127.0.0.1", listen), _make_handler(backend, app, gate))
+    extra = "  + cookie login" if gate is not None else ""
+    print(f"omarchy-theme proxy: 127.0.0.1:{listen} -> :{backend} ({app}){extra}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

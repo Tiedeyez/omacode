@@ -47,15 +47,9 @@ CONF_FILE = STATE / "config.json"
 
 
 def is_omarchy() -> bool:
-    """The Omarchy theme skin is a bonus, not a dependency. It engages only on
-    an Omarchy desktop; everywhere else omacode serves OpenCode's UI as-is."""
+    """The proxy always runs (it holds the cookie login). The Omarchy theme
+    skin on top of it is a bonus that engages only on an Omarchy desktop."""
     return (_STATE_HOME / "omarchy" / "current" / "theme").is_dir()
-
-
-def themed() -> bool:
-    """Whether the theme proxy is in play. Set at `init`; falls back to a live
-    Omarchy check so an install that predates the `themed` key keeps working."""
-    return bool(conf().get("themed", is_omarchy()))
 
 
 # -- helpers -------------------------------------------------------------- #
@@ -87,21 +81,31 @@ def save_conf(**kw):
     CONF_FILE.write_text(json.dumps(c, indent=2) + "\n")
 
 
-def password() -> str | None:
+def _env_val(key: str) -> str | None:
     try:
-        m = re.search(r"^OPENCODE_SERVER_PASSWORD=(.+)$", ENV_FILE.read_text(), re.M)
+        m = re.search(rf"^{re.escape(key)}=(.+)$", ENV_FILE.read_text(), re.M)
         return m.group(1).strip() if m else None
     except OSError:
         return None
 
 
+def password() -> str | None:
+    return _env_val("OPENCODE_SERVER_PASSWORD")
+
+
+def session_secret() -> str | None:
+    return _env_val("OMACODE_SESSION_SECRET")
+
+
 def _mint_password() -> str:
     STATE.mkdir(parents=True, exist_ok=True)
     pw = secrets.token_urlsafe(24)
-    # write with 0600 from the start — never a moment where it is world-readable
+    # write with 0600 from the start — never a moment where it is world-readable.
+    # the session secret signs the proxy's login cookie; stable across restarts.
     fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(f"OPENCODE_SERVER_PASSWORD={pw}\n")
+        fh.write(f"OMACODE_SESSION_SECRET={secrets.token_urlsafe(42)}\n")
     return pw
 
 
@@ -148,6 +152,10 @@ def cmd_init(args):
     pw = password()
     if pw and not args.rotate:
         print(f"password already set ({ENV_FILE}) — use --rotate to replace it")
+        if not session_secret():           # older install: add the cookie-signing secret
+            with open(os.open(ENV_FILE, os.O_WRONLY | os.O_APPEND, 0o600), "w") as fh:
+                fh.write(f"OMACODE_SESSION_SECRET={secrets.token_urlsafe(42)}\n")
+            print("added a session secret for the proxy's cookie login")
     else:
         pw = _mint_password()
         print(f"minted a new password -> {ENV_FILE} (0600)")
@@ -175,13 +183,13 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 """)
-    # A tiny reverse proxy in front of the backend, injecting one stylesheet
-    # built from the live Omarchy theme. OpenCode's SPA can't be patched — it's
-    # someone else's project — so the theming rides on top of it. Omarchy only:
-    # everywhere else the tailnet points straight at the backend.
-    if omarchy:
-        (unit / THEME_UNIT).write_text(f"""[Unit]
-Description=omacode — Omarchy theme proxy in front of the OpenCode UI
+    # A tiny reverse proxy in front of the backend. It does two jobs: a
+    # cookie login (so a phone browser stops re-prompting for the Basic
+    # password every time you leave the tab — OpenCode's server only speaks
+    # Basic), and — on Omarchy — repainting the UI in the live desktop theme.
+    # The tailnet always points at this, never the raw backend.
+    (unit / THEME_UNIT).write_text(f"""[Unit]
+Description=omacode — proxy in front of OpenCode (cookie login{'' if not omarchy else ' + Omarchy theme'})
 After={UNIT}
 BindsTo={UNIT}
 
@@ -194,39 +202,38 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 """)
-    else:
-        (unit / THEME_UNIT).unlink(missing_ok=True)
     _sc("daemon-reload")
-    print(f"unit written    -> {unit / UNIT}")
-    if omarchy:
-        print(f"theme proxy     -> {unit / THEME_UNIT}  (127.0.0.1:{args.proxy_port}, Omarchy skin)")
+    print(f"units written   -> {unit / UNIT}")
+    print(f"                   {unit / THEME_UNIT}  (127.0.0.1:{args.proxy_port}"
+          + (", cookie login + Omarchy skin)" if omarchy else ", cookie login)"))
     print(f"working dir     -> {work}")
-    print(f"backend         -> 127.0.0.1:{args.port}  (loopback)"
-          + (f"  ·  tailnet sees the omarchy proxy on {args.proxy_port}" if omarchy else ""))
+    print(f"backend         -> 127.0.0.1:{args.port}  (loopback; the tailnet sees the proxy)")
     print("\nnext:  omacode start   then   omacode expose")
 
 
 def cmd_proxy(args):
     sys.path.insert(0, str(HERE))
     import _omarchytheme
+    pw, secret = password(), session_secret()
+    gate = None
+    if pw and secret:
+        gate = _omarchytheme.CookieGate(secret=secret, password=pw, username=BASIC_USER,
+                                        prefix="/__omacode", title="omacode")
     _omarchytheme.serve(listen=conf().get("proxy_port", DEFAULT_PROXY),
-                        backend=conf().get("port", DEFAULT_PORT), app="opencode")
+                        backend=conf().get("port", DEFAULT_PORT), app="opencode", gate=gate)
 
 
 def cmd_start(args):
     if not password():
         sys.exit("no password yet — run: omacode init")
     _sc("enable", "--now", UNIT)
-    line = f"backend {_sc('is-active', UNIT).stdout.strip()}"
-    if themed():
-        _sc("enable", "--now", THEME_UNIT)
-        line += f"  ·  theme proxy {_sc('is-active', THEME_UNIT).stdout.strip()}"
-    print(line)
+    _sc("enable", "--now", THEME_UNIT)
+    print(f"backend {_sc('is-active', UNIT).stdout.strip()}  ·  "
+          f"proxy {_sc('is-active', THEME_UNIT).stdout.strip()}")
 
 
 def cmd_stop(args):
-    if themed():
-        _sc("disable", "--now", THEME_UNIT)
+    _sc("disable", "--now", THEME_UNIT)
     _sc("disable", "--now", UNIT)
     if exposed_mount():
         cmd_hide(args)
@@ -236,10 +243,8 @@ def cmd_stop(args):
 def cmd_expose(args):
     if _sc("is-active", UNIT).stdout.strip() != "active":
         sys.exit("server is not running — run: omacode start")
-    front_themed = themed() and _sc("is-active", THEME_UNIT).stdout.strip() == "active"
-    # front the tailnet with the theme proxy when it's up; the raw backend
-    # otherwise (still works, just unthemed)
-    port = conf().get("proxy_port", DEFAULT_PROXY) if front_themed else conf().get("port", DEFAULT_PORT)
+    # the tailnet always fronts the proxy (cookie login; theme on Omarchy)
+    port = conf().get("proxy_port", DEFAULT_PROXY)
     old = exposed_mount()
     if old and old[1] == args.https:
         pass
@@ -275,11 +280,12 @@ def _print_access():
         return
     print("OpenCode is on your tailnet:\n")
     print(f"  URL       {m[0]}")
-    print(f"  user      {BASIC_USER}")
     print(f"  password  {pw}")
-    print("\nTailnet-only (never Funnel), and the password is the second lock.")
-    print("This drives an agent that can run commands as you — run `omacode hide`")
-    print("when you're done.")
+    print("\nOpen the URL, enter the password once — the proxy keeps you signed in")
+    print("on that device (a signed cookie, not Basic auth, so backgrounding the")
+    print("tab won't log you out). Tailnet-only, never Funnel; the password is the")
+    print("second lock. This drives an agent that runs commands as you — `omacode")
+    print("hide` when you're done.")
 
 
 def cmd_status(args):
