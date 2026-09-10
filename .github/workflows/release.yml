@@ -1,0 +1,53 @@
+name: release
+
+# Reusable release pipeline for Tiedeyez repos.
+# Convention (from omacode/hermcode/omabench): tag vX.Y.Z, GitHub Release,
+# notes auto-drafted from commits since the previous tag.
+# Other repos: copy this file, keep the on: push trigger on the tag glob.
+#
+# Jimmie's release posture: main is the release branch; tags are the only
+# "published" artifacts; release notes auto-drafted, never fabricated.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Draft release notes from commits
+        id: notes
+        run: |
+          PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            RANGE="$PREV..${GITHUB_REF_NAME}"
+          else
+            RANGE="${GITHUB_REF_NAME}"
+          fi
+          {
+            echo "body<<EOF"
+            echo "## What changed"
+            echo ""
+            git log --no-merges --pretty='- %s (%h)' "$RANGE" | head -40
+            echo ""
+            echo "Full diff: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/$RANGE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
